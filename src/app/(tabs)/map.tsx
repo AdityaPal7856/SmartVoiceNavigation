@@ -16,9 +16,11 @@ import {
   TextInput,
   ScrollView,
   Alert,
+  Modal,
   Animated,
   PanResponder,
   Keyboard,
+  Linking,
 } from "react-native";
 
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -109,6 +111,35 @@ type RouteStep = {
 };
 
 
+type EmergencyContact = {
+  id: string;
+  name: string;
+  relation: string;
+  phone: string;
+};
+
+const buildEmergencyMessage = (location?: Coordinates | null) => {
+  if (location) {
+    const mapsUrl =
+      `https://www.google.com/maps/search/?api=1&query=${location.latitude},${location.longitude}`;
+
+    return [
+      "🚨 EMERGENCY ALERT",
+      "I may need help. Please contact me as soon as possible.",
+      "",
+      "My current location:",
+      mapsUrl,
+    ].join("\n");
+  }
+
+  return [
+    "🚨 EMERGENCY ALERT",
+    "I may need help. Please contact me as soon as possible.",
+    "My current GPS location is currently unavailable.",
+  ].join("\n");
+};
+
+
 // ==================================================
 // HELPERS
 // ==================================================
@@ -125,6 +156,36 @@ const distanceBetween = (a: Coordinates, b: Coordinates) => {
     Math.sin(dLat / 2) ** 2 +
     Math.sin(dLon / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
   return 2 * earthRadius * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+};
+
+const distanceToRouteMeters = (point: Coordinates, route: Coordinates[]) => {
+  if (route.length < 2) return Number.POSITIVE_INFINITY;
+
+  let minimum = Number.POSITIVE_INFINITY;
+
+  // Local equirectangular approximation is accurate enough for short road segments.
+  const latScale = 111320;
+  const lonScale = 111320 * Math.cos(toRadians(point.latitude));
+  const px = point.longitude * lonScale;
+  const py = point.latitude * latScale;
+
+  for (let i = 0; i < route.length - 1; i += 1) {
+    const ax = route[i].longitude * lonScale;
+    const ay = route[i].latitude * latScale;
+    const bx = route[i + 1].longitude * lonScale;
+    const by = route[i + 1].latitude * latScale;
+    const dx = bx - ax;
+    const dy = by - ay;
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared === 0
+      ? 0
+      : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSquared));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    minimum = Math.min(minimum, Math.hypot(px - cx, py - cy));
+  }
+
+  return minimum;
 };
 
 
@@ -149,10 +210,12 @@ export default function MapScreen() {
   const params = useLocalSearchParams<{
     destination?: string;
     autoStart?: string;
+    navigationAction?: string;
   }>();
 
   const autoNavigationKeyRef = useRef<string | null>(null);
   const autoStartNavigationRef = useRef(false);
+  const lastNavigationActionRef = useRef<string | null>(null);
   const navigationHandlerRef = useRef<
     ((payload: { destination: string }) => void | Promise<void>) | null
   >(null);
@@ -166,6 +229,37 @@ export default function MapScreen() {
   const locationSubscriptionRef = useRef<Location.LocationSubscription | null>(null);
   const routeStepsRef = useRef<RouteStep[]>([]);
   const currentStepIndexRef = useRef(0);
+  const offRouteCountRef = useRef(0);
+  const reroutingRef = useRef(false);
+  const arrivalHandledRef = useRef(false);
+
+  // ==================================================
+  // ROUTES API REQUEST PROTECTION
+  // ==================================================
+  // These guards prevent accidental duplicate/rapid ComputeRoutes calls.
+  // They do not change Google's quota; they only reduce requests made by this app.
+  const trafficCheckingRef = useRef(false);
+  const routeRequestInFlightRef = useRef(false);
+  const lastRouteRequestAtRef = useRef(0);
+  const lastRouteKeyRef = useRef<string | null>(null);
+  const lastRouteSuccessAtRef = useRef(0);
+  const routeQuotaBlockedUntilRef = useRef(0);
+  const trafficCacheRef = useRef<{
+    key: string;
+    checkedAt: number;
+    travelMinutes: number;
+    normalMinutes: number;
+    delayMinutes: number;
+    trafficLevel: string;
+  } | null>(null);
+
+  // Conservative client-side daily budget. This protects the app from
+  // runaway loops. It cannot protect the whole Google Cloud project if
+  // other apps/devices use the same project.
+  const ROUTES_DAILY_CLIENT_LIMIT = 80;
+  const ROUTES_MIN_INTERVAL_MS = 5000;
+  const ROUTE_CACHE_MS = 60 * 1000;
+  const TRAFFIC_CACHE_MS = 2 * 60 * 1000;
 
 
   // ------------------------------------------------
@@ -228,6 +322,13 @@ export default function MapScreen() {
   const [routeSteps, setRouteSteps] = useState<RouteStep[]>([]);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [navigationStarted, setNavigationStarted] = useState(false);
+  const [navigationPaused, setNavigationPaused] = useState(false);
+  const [avoidTraffic, setAvoidTraffic] = useState(false);
+  const [avoidTolls, setAvoidTolls] = useState(false);
+  const [avoidHighways, setAvoidHighways] = useState(false);
+  const [avoidFerries, setAvoidFerries] = useState(false);
+  const [navigationLanguage, setNavigationLanguage] = useState<"en-US" | "hi-IN">("en-US");
+  const [voiceSpeed, setVoiceSpeed] = useState(1.0);
   const [travelInfo, setTravelInfo] = useState<{ distance: number; duration: number } | null>(null);
 
 
@@ -273,17 +374,175 @@ export default function MapScreen() {
 
 
   // ==================================================
+  // PERSISTENT NAVIGATION SETTINGS
+  // ==================================================
+  useEffect(() => {
+    void (async () => {
+      try {
+        const raw = await AsyncStorage.getItem("@smart_voice_navigation_settings");
+        if (!raw) return;
+        const saved = JSON.parse(raw);
+        if (typeof saved.traffic === "boolean") setAvoidTraffic(saved.traffic);
+        else if (typeof saved.avoidTraffic === "boolean") setAvoidTraffic(saved.avoidTraffic);
+        if (typeof saved.avoidTolls === "boolean") setAvoidTolls(saved.avoidTolls);
+        if (typeof saved.avoidHighways === "boolean") setAvoidHighways(saved.avoidHighways);
+        if (typeof saved.avoidFerries === "boolean") setAvoidFerries(saved.avoidFerries);
+        if (saved.voiceLanguage === "Hindi (India)") setNavigationLanguage("hi-IN");
+        else if (saved.voiceLanguage === "English (India)" || saved.voiceLanguage === "Hinglish") setNavigationLanguage("en-US");
+        else if (saved.navigationLanguage === "hi-IN" || saved.navigationLanguage === "en-US") setNavigationLanguage(saved.navigationLanguage);
+        if (typeof saved.voiceSpeed === "number") setVoiceSpeed(Math.min(1.2, Math.max(0.7, saved.voiceSpeed)));
+      } catch (e) { console.warn("[Map] Navigation settings load failed", e); }
+    })();
+  }, []);
+
+  // Navigation preferences are owned by Settings and read here.
+  // Route recalculation uses the latest in-memory values.
+
+
+  const speakNavigationInstruction = useCallback((instruction: string) => {
+    const value = String(instruction || "").trim();
+    if (!value) return;
+    Speech.stop();
+    if (navigationLanguage === "hi-IN") {
+      let hindi = value
+        .replace(/Make a U-turn/gi, "यू-टर्न लें")
+        .replace(/Turn sharp left/gi, "तेज़ बाएँ मुड़ें")
+        .replace(/Turn sharp right/gi, "तेज़ दाएँ मुड़ें")
+        .replace(/Turn left/gi, "बाएँ मुड़ें")
+        .replace(/Turn right/gi, "दाएँ मुड़ें")
+        .replace(/Keep left/gi, "बाएँ रहें")
+        .replace(/Keep right/gi, "दाएँ रहें")
+        .replace(/Continue/gi, "सीधे चलते रहें")
+        .replace(/Take the roundabout/gi, "राउंडअबाउट लें")
+        .replace(/At the roundabout/gi, "राउंडअबाउट पर")
+        .replace(/Destination reached/gi, "आप अपने गंतव्य पर पहुँच गए हैं")
+        .replace(/Arrive at/gi, "गंतव्य पर पहुँचें");
+      if (hindi === value) hindi = `आगे: ${value}`;
+      Speech.speak(hindi, { language: "hi-IN", rate: 0.95 });
+    } else {
+      Speech.speak(value, { language: "en-US", rate: 0.95 });
+    }
+  }, [navigationLanguage, voiceSpeed]);
+
+  // ==================================================
+  // ROUTES API QUOTA / CACHE HELPERS
+  // ==================================================
+
+  const getRoutesUsageKey = useCallback(() => {
+    const day = new Date().toISOString().slice(0, 10);
+    return `smartVoiceNavigation_routesUsage_${day}`;
+  }, []);
+
+  const getRoutesUsageCount = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(getRoutesUsageKey());
+      const count = Number(raw || 0);
+      return Number.isFinite(count) ? count : 0;
+    } catch {
+      return 0;
+    }
+  }, [getRoutesUsageKey]);
+
+  const incrementRoutesUsage = useCallback(async () => {
+    const next = (await getRoutesUsageCount()) + 1;
+    try {
+      await AsyncStorage.setItem(getRoutesUsageKey(), String(next));
+    } catch (error) {
+      console.warn("[Routes API] Usage counter save failed:", error);
+    }
+    return next;
+  }, [getRoutesUsageCount, getRoutesUsageKey]);
+
+  const makeRouteRequestKey = useCallback((
+    routeOrigin: Coordinates,
+    routeDestination: Coordinates,
+    options: { alternative?: boolean; avoidTraffic?: boolean } = {}
+  ) => {
+    // Four decimal places is roughly 11 m latitude precision. This avoids
+    // treating tiny GPS jitter as a completely new route request.
+    const round = (n: number) => Math.round(n * 10000) / 10000;
+    return JSON.stringify({
+      o: [round(routeOrigin.latitude), round(routeOrigin.longitude)],
+      d: [round(routeDestination.latitude), round(routeDestination.longitude)],
+      a: Boolean(options.alternative),
+      t: Boolean(options.avoidTraffic),
+      tolls: Boolean(avoidTolls),
+      highways: Boolean(avoidHighways),
+      ferries: Boolean(avoidFerries),
+      language: navigationLanguage,
+    });
+  }, [avoidFerries, avoidHighways, avoidTolls, navigationLanguage]);
+
+  // ==================================================
   // CALCULATE ROUTE
   // ==================================================
 
   const calculateRoute = useCallback(
-    async (routeOrigin: Coordinates, routeDestination: Coordinates) => {
+    async (
+      routeOrigin: Coordinates,
+      routeDestination: Coordinates,
+      options: {
+        alternative?: boolean;
+        avoidTraffic?: boolean;
+      } = {}
+    ) => {
       try {
         assertApiKey(ROUTES_API_KEY, "Google Routes");
+
+        const now = Date.now();
+        const routeKey = makeRouteRequestKey(routeOrigin, routeDestination, options);
+
+        if (routeQuotaBlockedUntilRef.current > now) {
+          const minutes = Math.ceil(
+            (routeQuotaBlockedUntilRef.current - now) / 60000
+          );
+          console.warn(
+            `[Routes API] Temporarily blocked after quota error. Retry in about ${minutes} min.`
+          );
+          Alert.alert(
+            "Routes API Limit",
+            `Google Routes API quota was reached. The app will wait about ${minutes} minutes before trying again.`
+          );
+          return false;
+        }
+
+        if (routeRequestInFlightRef.current) {
+          console.log("[Routes API] Request already in progress. Skipping duplicate.");
+          return false;
+        }
+
+        if (
+          lastRouteKeyRef.current === routeKey &&
+          now - lastRouteSuccessAtRef.current < ROUTE_CACHE_MS
+        ) {
+          console.log("[Routes API] Using cached route. Skipping duplicate request.");
+          return true;
+        }
+
+        if (now - lastRouteRequestAtRef.current < ROUTES_MIN_INTERVAL_MS) {
+          console.log("[Routes API] Rate guard active. Skipping rapid duplicate request.");
+          return false;
+        }
+
+        const usageCount = await getRoutesUsageCount();
+        if (usageCount >= ROUTES_DAILY_CLIENT_LIMIT) {
+          console.warn("[Routes API] Daily client safety limit reached:", usageCount);
+          Alert.alert(
+            "Routes API Safety Limit",
+            `This app has stopped new route requests after ${ROUTES_DAILY_CLIENT_LIMIT} requests today to help protect the Google quota. Try again tomorrow.`
+          );
+          return false;
+        }
+
+        routeRequestInFlightRef.current = true;
+        lastRouteRequestAtRef.current = now;
+        await incrementRoutesUsage();
+
         console.log("[Routes API] Calculating route...");
 
         setRouteReady(false);
         setNavigationStarted(false);
+        setNavigationPaused(false);
         setTravelInfo(null);
         setRouteCoordinates([]);
         setRouteSteps([]);
@@ -299,16 +558,22 @@ export default function MapScreen() {
               "Content-Type": "application/json",
               "X-Goog-Api-Key": ROUTES_API_KEY,
               "X-Goog-FieldMask":
-                "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.navigationInstruction,routes.legs.steps.endLocation",
+                "routes.distanceMeters,routes.duration,routes.staticDuration,routes.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.navigationInstruction,routes.legs.steps.endLocation",
             },
             body: JSON.stringify({
               origin: { location: { latLng: { latitude: routeOrigin.latitude, longitude: routeOrigin.longitude } } },
               destination: { location: { latLng: { latitude: routeDestination.latitude, longitude: routeDestination.longitude } } },
               travelMode: "DRIVE",
-              routingPreference: "TRAFFIC_AWARE",
-              computeAlternativeRoutes: false,
-              routeModifiers: { avoidTolls: false, avoidHighways: false, avoidFerries: false },
-              languageCode: "en-US",
+              routingPreference: options.avoidTraffic
+                ? "TRAFFIC_AWARE_OPTIMAL"
+                : "TRAFFIC_AWARE",
+              computeAlternativeRoutes: Boolean(options.alternative),
+              routeModifiers: {
+                avoidTolls: options.avoidTolls ?? avoidTolls,
+                avoidHighways: options.avoidHighways ?? avoidHighways,
+                avoidFerries: options.avoidFerries ?? avoidFerries,
+              },
+              languageCode: navigationLanguage,
               units: "METRIC",
             }),
           }
@@ -320,7 +585,12 @@ export default function MapScreen() {
           throw new Error(data?.error?.message || `Routes API HTTP ${response.status}`);
         }
 
-        const route = data?.routes?.[0];
+        const routes = Array.isArray(data?.routes) ? data.routes : [];
+        const route =
+          options.alternative && routes.length > 1
+            ? routes[1]
+            : routes[0];
+
         if (!route) throw new Error("No route found.");
 
         const steps: RouteStep[] = (route?.legs || []).flatMap((leg: any) =>
@@ -354,10 +624,44 @@ export default function MapScreen() {
 
         setRouteCoordinates(coordinates);
         setTravelInfo({ distance: distanceKm, duration: durationMinutes });
+        lastRouteKeyRef.current = routeKey;
+        lastRouteSuccessAtRef.current = Date.now();
+        routeQuotaBlockedUntilRef.current = 0;
+
+        // Save the traffic-aware duration from this route so a voice command
+        // like "traffic batao" can answer from the already-fetched route
+        // instead of immediately spending another ComputeRoutes request.
+        const trafficDurationSeconds = Number(
+          String(route.duration || "0").replace("s", "")
+        );
+        const staticDurationSeconds = Number(
+          String(route.staticDuration || route.duration || "0").replace("s", "")
+        );
+        const delayMinutes = Math.max(
+          0,
+          Math.round((trafficDurationSeconds - staticDurationSeconds) / 60)
+        );
+        const travelMinutes = Math.round(trafficDurationSeconds / 60);
+        const normalMinutes = Math.round(staticDurationSeconds / 60);
+        const trafficLevel =
+          delayMinutes > 15 ? "heavy" : delayMinutes > 5 ? "moderate" : "light";
+        trafficCacheRef.current = {
+          key: routeKey,
+          checkedAt: Date.now(),
+          travelMinutes,
+          normalMinutes,
+          delayMinutes,
+          trafficLevel,
+        };
+
         setRouteReady(true);
 
         const shouldAutoStart = autoStartNavigationRef.current;
         autoStartNavigationRef.current = false;
+        setNavigationPaused(false);
+        offRouteCountRef.current = 0;
+        reroutingRef.current = false;
+        arrivalHandledRef.current = false;
         setNavigationStarted(shouldAutoStart);
 
         console.log(
@@ -382,14 +686,32 @@ export default function MapScreen() {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn("[Map] Routes API error:", message);
+
+        if (/quota exceeded|daily quota|rate limit|resource exhausted/i.test(message)) {
+          // Stop this app from hammering a project after Google reports quota exhaustion.
+          routeQuotaBlockedUntilRef.current = Date.now() + 60 * 60 * 1000;
+        }
+
         setRouteReady(false);
         setNavigationStarted(false);
         setRouteCoordinates([]);
         setTravelInfo(null);
         Alert.alert("Route Error", message);
+        return false;
+      } finally {
+        routeRequestInFlightRef.current = false;
       }
     },
-    [decodePolyline]
+    [
+      decodePolyline,
+      getRoutesUsageCount,
+      incrementRoutesUsage,
+      makeRouteRequestKey,
+      avoidFerries,
+      avoidHighways,
+      avoidTolls,
+      navigationLanguage,
+    ]
   );
 
 
@@ -660,6 +982,194 @@ export default function MapScreen() {
 
 
   // ==================================================
+  // EMERGENCY / SOS
+  // ==================================================
+
+  const [sosLoading, setSosLoading] = useState(false);
+  const [sosContacts, setSosContacts] = useState<EmergencyContact[]>([]);
+  const [selectedSosIds, setSelectedSosIds] = useState<string[]>([]);
+  const [sosLocation, setSosLocation] = useState<Coordinates | null>(null);
+  const [sosPickerVisible, setSosPickerVisible] = useState(false);
+
+  const loadEmergencyContacts = useCallback(async (): Promise<EmergencyContact[]> => {
+    const user = auth.currentUser;
+    if (!user) return [];
+
+    try {
+      const snap = await getDoc(doc(db, "users", user.uid));
+      if (!snap.exists()) return [];
+
+      const data = snap.data();
+      const contacts = Array.isArray(data?.emergencyContacts)
+        ? data.emergencyContacts
+        : data?.emergencyContact
+          ? [data.emergencyContact]
+          : [];
+
+      return contacts
+        .filter((contact: any) => contact?.phone)
+        .map((contact: any, index: number) => ({
+          id: String(contact?.id || index),
+          name: String(contact?.name || "Emergency Contact"),
+          relation: String(contact?.relation || "Emergency Contact"),
+          phone: String(contact?.phone || ""),
+        }));
+    } catch (error) {
+      console.warn("[SOS] Emergency contacts load error:", error);
+      return [];
+    }
+  }, []);
+
+  const getEmergencyLocation = useCallback(async (): Promise<Coordinates | null> => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") return null;
+
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+
+      return {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      };
+    } catch (error) {
+      console.warn("[SOS] Location unavailable:", error);
+      return null;
+    }
+  }, []);
+
+  const buildSosMessage = useCallback((location: Coordinates | null) => {
+    if (!location) {
+      return "Emergency SOS: I may need help. My GPS location is currently unavailable. Please contact me as soon as possible.";
+    }
+
+    return `Emergency SOS: I may need help. Please contact me as soon as possible.
+
+My current location:
+https://www.google.com/maps/search/?api=1&query=${location.latitude},${location.longitude}`;
+  }, []);
+
+  const openEmergencySms = useCallback(
+    async (contacts: EmergencyContact[], location: Coordinates | null) => {
+      if (!contacts.length) return false;
+
+      // Most Android SMS apps accept comma-separated recipients. If the
+      // device does not support it, fall back to the first selected contact.
+      const recipients = contacts.map((c) => c.phone).join(",");
+      const body = buildSosMessage(location);
+      const url = `sms:${recipients}?body=${encodeURIComponent(body)}`;
+
+      try {
+        const supported = await Linking.canOpenURL(url);
+        if (!supported) {
+          Alert.alert("SMS Unavailable", "Your device cannot open the SMS application.");
+          return false;
+        }
+
+        await Linking.openURL(url);
+        return true;
+      } catch (error) {
+        console.error("[SOS] SMS error:", error);
+        Alert.alert("SMS Error", "Unable to open the SMS application.");
+        return false;
+      }
+    },
+    [buildSosMessage]
+  );
+
+  const openEmergencyCall = useCallback(async (contact: EmergencyContact) => {
+    const url = `tel:${contact.phone}`;
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) {
+        Alert.alert("Call Unavailable", "Your device cannot open the phone dialer.");
+        return;
+      }
+      await Linking.openURL(url);
+    } catch (error) {
+      console.error("[SOS] Call error:", error);
+      Alert.alert("Call Error", "Unable to open the phone dialer.");
+    }
+  }, []);
+
+  const openSosActions = useCallback((contacts: EmergencyContact[], location: Coordinates | null) => {
+    const names = contacts.map((c) => c.name).join(", ");
+    const locationStatus = location
+      ? `GPS location attached:
+${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`
+      : "GPS location unavailable.";
+
+    Alert.alert(
+      "Emergency SOS Ready",
+      `Selected: ${names}
+
+${locationStatus}`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Open SMS",
+          onPress: () => void openEmergencySms(contacts, location),
+        },
+        {
+          text: "Call",
+          onPress: () => {
+            Alert.alert(
+              "Call Emergency Contact",
+              "Choose a contact to call.",
+              contacts.map((contact) => ({
+                text: `${contact.name} • ${contact.phone}`,
+                onPress: () => void openEmergencyCall(contact),
+              })).concat([{ text: "Cancel", style: "cancel" as const }])
+            );
+          },
+        },
+      ]
+    );
+  }, [openEmergencyCall, openEmergencySms]);
+
+  const confirmSelectedSos = useCallback(async () => {
+    const selected = sosContacts.filter((contact) => selectedSosIds.includes(contact.id));
+    if (!selected.length) {
+      Alert.alert("Select Contact", "Please select at least one emergency contact.");
+      return;
+    }
+
+    setSosPickerVisible(false);
+    setSosLoading(true);
+
+    try {
+      const location = await getEmergencyLocation();
+      setSosLocation(location);
+      openSosActions(selected, location);
+    } finally {
+      setSosLoading(false);
+    }
+  }, [getEmergencyLocation, openSosActions, selectedSosIds, sosContacts]);
+
+  const triggerEmergencySOS = useCallback(async () => {
+    if (sosLoading) return;
+
+    setSosLoading(true);
+    try {
+      const contacts = await loadEmergencyContacts();
+      if (!contacts.length) {
+        Alert.alert("No Emergency Contact", "Please add an emergency contact before using SOS.");
+        return;
+      }
+
+      setSosContacts(contacts);
+      setSelectedSosIds(contacts.map((contact) => contact.id));
+      setSosPickerVisible(true);
+    } catch (error) {
+      console.error("[SOS] Trigger error:", error);
+      Alert.alert("SOS Error", "Unable to load emergency contacts.");
+    } finally {
+      setSosLoading(false);
+    }
+  }, [loadEmergencyContacts, sosLoading]);
+
+  // ==================================================
   // HANDLE VOICE NAVIGATION
   // ==================================================
 
@@ -718,6 +1228,270 @@ export default function MapScreen() {
   }, [savedHomeAddress, savedWorkAddress]);
 
   // ==================================================
+  // VOICE NAVIGATION ACTIONS
+  // ==================================================
+
+  const pauseNavigation = useCallback(() => {
+    if (!navigationStarted) return;
+    Speech.stop();
+    setNavigationPaused(true);
+    console.log("[Navigation] Paused by voice command");
+  }, [navigationStarted, navigationPaused]);
+
+  const resumeNavigation = useCallback(() => {
+    if (!navigationStarted) return;
+    setNavigationPaused(false);
+    console.log("[Navigation] Resumed by voice command");
+
+    const step = routeStepsRef.current[currentStepIndexRef.current];
+    if (step?.instruction) {
+      speakNavigationInstruction(step.instruction);
+    }
+  }, [navigationStarted]);
+
+  const recalculateAlternativeRoute = useCallback(async () => {
+    if (!origin || !destination) return;
+    setAvoidTraffic(false);
+    autoStartNavigationRef.current = navigationStarted;
+    await calculateRoute(origin, destination, { alternative: true, avoidTolls, avoidHighways, avoidFerries });
+  }, [origin, destination, navigationStarted, calculateRoute]);
+
+  const recalculateAvoidTrafficRoute = useCallback(async () => {
+    if (!origin || !destination) return;
+    setAvoidTraffic(true);
+    autoStartNavigationRef.current = navigationStarted;
+    await calculateRoute(origin, destination, { avoidTraffic: true, avoidTolls, avoidHighways, avoidFerries });
+  }, [origin, destination, navigationStarted, calculateRoute]);
+
+  const checkLiveTraffic = useCallback(async () => {
+    if (trafficCheckingRef.current) {
+      console.log("[Traffic] Already checking, ignoring duplicate request.");
+      return;
+    }
+
+    if (!origin || !destination) {
+      const message =
+        "Please set a destination first. I need a route to check live traffic.";
+      Speech.stop();
+      Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+      Alert.alert("Traffic", message);
+      return;
+    }
+
+    const routeKey = makeRouteRequestKey(origin, destination, {
+      avoidTraffic,
+    });
+    const cached = trafficCacheRef.current;
+
+    // Most importantly: do NOT call ComputeRoutes again when we already have
+    // a recent traffic-aware route. This saves quota on repeated voice commands.
+    if (cached && cached.key === routeKey && Date.now() - cached.checkedAt < TRAFFIC_CACHE_MS) {
+      console.log("[Traffic] Using cached traffic result. No API request needed.");
+
+      const message =
+        cached.delayMinutes === 0
+          ? `Traffic is light on your route. Estimated travel time is ${cached.travelMinutes} minutes.`
+          : `Traffic is ${cached.trafficLevel} on your route. Estimated travel time is ${cached.travelMinutes} minutes, with approximately ${cached.delayMinutes} minutes of delay.`;
+
+      Speech.stop();
+      Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+      Alert.alert("Live Traffic", message);
+      return;
+    }
+
+    if (trafficCheckingRef.current) return;
+    trafficCheckingRef.current = true;
+
+    try {
+      assertApiKey(ROUTES_API_KEY, "Google Routes");
+
+      const now = Date.now();
+      if (routeQuotaBlockedUntilRef.current > now) {
+        const minutes = Math.ceil((routeQuotaBlockedUntilRef.current - now) / 60000);
+        const message = `Live traffic is temporarily unavailable because the Google Routes quota was reached. Please try again in about ${minutes} minutes.`;
+        Speech.stop();
+        Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+        Alert.alert("Traffic Temporarily Unavailable", message);
+        return;
+      }
+
+      const usageCount = await getRoutesUsageCount();
+      if (usageCount >= ROUTES_DAILY_CLIENT_LIMIT) {
+        const message = `The app has reached its daily safety limit of ${ROUTES_DAILY_CLIENT_LIMIT} Google Routes requests. This prevents repeated requests from consuming more quota today.`;
+        Speech.stop();
+        Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+        Alert.alert("Routes API Safety Limit", message);
+        return;
+      }
+
+      if (Date.now() - lastRouteRequestAtRef.current < ROUTES_MIN_INTERVAL_MS) {
+        console.log("[Traffic] Rate guard active. Using existing route instead of another request.");
+        const fallback = trafficCacheRef.current;
+        if (fallback) {
+          const message =
+            fallback.delayMinutes === 0
+              ? `Traffic is light on your route. Estimated travel time is ${fallback.travelMinutes} minutes.`
+              : `Traffic is ${fallback.trafficLevel} on your route. Estimated travel time is ${fallback.travelMinutes} minutes, with approximately ${fallback.delayMinutes} minutes of delay.`;
+          Speech.stop();
+          Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+          Alert.alert("Live Traffic", message);
+        }
+        return;
+      }
+
+      if (routeRequestInFlightRef.current) {
+        console.log("[Traffic] Routes API request already in progress. Skipping.");
+        return;
+      }
+
+      routeRequestInFlightRef.current = true;
+      lastRouteRequestAtRef.current = Date.now();
+      console.log("[Traffic] Checking live traffic...");
+
+      const response = await fetch(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": ROUTES_API_KEY,
+            "X-Goog-FieldMask":
+              "routes.distanceMeters,routes.duration,routes.staticDuration",
+          },
+          body: JSON.stringify({
+            origin: { location: { latLng: { latitude: origin.latitude, longitude: origin.longitude } } },
+            destination: { location: { latLng: { latitude: destination.latitude, longitude: destination.longitude } } },
+            travelMode: "DRIVE",
+            routingPreference: "TRAFFIC_AWARE",
+            departureTime: new Date(Date.now() + 60 * 1000).toISOString(),
+            computeAlternativeRoutes: false,
+            languageCode: navigationLanguage,
+            units: "METRIC",
+          }),
+        }
+      );
+
+      await incrementRoutesUsage();
+      lastRouteRequestAtRef.current = Date.now();
+
+      const data = await response.json();
+      if (!response.ok) {
+        const apiMessage = data?.error?.message || `Routes API HTTP ${response.status}`;
+        if (/quota exceeded|daily quota|rate limit|resource exhausted/i.test(apiMessage)) {
+          routeQuotaBlockedUntilRef.current = Date.now() + 60 * 60 * 1000;
+        }
+        throw new Error(apiMessage);
+      }
+
+      const route = data?.routes?.[0];
+      if (!route) throw new Error("No traffic route found.");
+
+      const trafficDurationSeconds = Number(String(route.duration || "0").replace("s", ""));
+      const normalDurationSeconds = Number(String(route.staticDuration || route.duration || "0").replace("s", ""));
+      const delayMinutes = Math.max(0, Math.round((trafficDurationSeconds - normalDurationSeconds) / 60));
+      const travelMinutes = Math.round(trafficDurationSeconds / 60);
+      const normalMinutes = Math.round(normalDurationSeconds / 60);
+      const trafficLevel = delayMinutes > 15 ? "heavy" : delayMinutes > 5 ? "moderate" : "light";
+
+      trafficCacheRef.current = {
+        key: routeKey,
+        checkedAt: Date.now(),
+        travelMinutes,
+        normalMinutes,
+        delayMinutes,
+        trafficLevel,
+      };
+
+      console.log("[Traffic] Result:", { delayMinutes, trafficLevel, travelMinutes, normalMinutes });
+
+      const message =
+        delayMinutes === 0
+          ? `Traffic is light on your route. Estimated travel time is ${travelMinutes} minutes.`
+          : `Traffic is ${trafficLevel} on your route. Estimated travel time is ${travelMinutes} minutes, with approximately ${delayMinutes} minutes of delay.`;
+
+      Speech.stop();
+      Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+      Alert.alert("Live Traffic", message);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("[Traffic] API error:", errorMessage);
+
+      const message = /quota exceeded|daily quota|rate limit|resource exhausted/i.test(errorMessage)
+        ? "Google Routes traffic quota has been reached. The app has stopped retrying automatically to protect your quota."
+        : "I could not get live traffic information right now.";
+
+      Speech.stop();
+      Speech.speak(message, { language: navigationLanguage, rate: voiceSpeed });
+      Alert.alert("Traffic", message);
+    } finally {
+      trafficCheckingRef.current = false;
+      routeRequestInFlightRef.current = false;
+    }
+  }, [
+    origin,
+    destination,
+    avoidTraffic,
+    navigationLanguage,
+    voiceSpeed,
+    makeRouteRequestKey,
+    getRoutesUsageCount,
+    incrementRoutesUsage,
+  ]);
+
+  const handleNavigationAction = useCallback(
+    async (action: string) => {
+      const value = String(action || "").toLowerCase().trim();
+
+      if (value === "pause") {
+        pauseNavigation();
+        return;
+      }
+
+      if (value === "resume") {
+        resumeNavigation();
+        return;
+      }
+
+      if (value === "alternative_route" || value === "alternative") {
+        await recalculateAlternativeRoute();
+        return;
+      }
+
+      if (value === "traffic") {
+        await checkLiveTraffic();
+        return;
+      }
+
+      if (value === "avoid_traffic" || value === "traffic_avoid") {
+        await recalculateAvoidTrafficRoute();
+        return;
+      }
+
+      if (value === "reroute") {
+        if (origin && destination) {
+          autoStartNavigationRef.current = navigationStarted;
+          await calculateRoute(origin, destination, { avoidTraffic, avoidTolls, avoidHighways, avoidFerries });
+        }
+      }
+    },
+    [
+      pauseNavigation,
+      resumeNavigation,
+      recalculateAlternativeRoute,
+      recalculateAvoidTrafficRoute,
+      checkLiveTraffic,
+      origin,
+      destination,
+      navigationStarted,
+      avoidTraffic,
+      avoidTolls,
+      avoidHighways,
+      avoidFerries,
+      calculateRoute,
+    ]
+  );
+
+  // ==================================================
   // AUTO START FROM VOICE PAGE
   // ==================================================
 
@@ -735,6 +1509,19 @@ export default function MapScreen() {
     void handleVoiceNavigation({ destination: destinationFromVoice });
   }, [params.destination, params.autoStart, handleVoiceNavigation]);
 
+
+  // Execute voice route controls sent from VoiceTab.
+  useEffect(() => {
+    const action = params.navigationAction?.trim();
+    if (!action) return;
+
+    // Router params can stay mounted while the Map screen re-renders.
+    // Do not execute the same voice action again on every render.
+    if (lastNavigationActionRef.current === action) return;
+
+    lastNavigationActionRef.current = action;
+    void handleNavigationAction(action);
+  }, [params.navigationAction, handleNavigationAction]);
 
   // ==================================================
   // KEEP LATEST HANDLER IN REF
@@ -781,17 +1568,61 @@ export default function MapScreen() {
 
           setOrigin(coords);
 
-          if (navigationStarted && routeStepsRef.current.length > 0) {
-            const step = routeStepsRef.current[currentStepIndexRef.current];
-            if (step?.endLocation) {
-              const remaining = distanceBetween(coords, step.endLocation);
-              if (remaining < 45 && currentStepIndexRef.current < routeStepsRef.current.length - 1) {
-                currentStepIndexRef.current += 1;
-                setCurrentStepIndex(currentStepIndexRef.current);
-                const nextStep = routeStepsRef.current[currentStepIndexRef.current];
-                if (nextStep?.instruction) {
-                  Speech.stop();
-                  Speech.speak(nextStep.instruction, { language: "en-US", rate: 0.95 });
+          if (navigationStarted && !navigationPaused && destination) {
+            // 1) Arrival detection.
+            const destinationDistance = distanceBetween(coords, destination);
+            if (destinationDistance <= 35 && !arrivalHandledRef.current) {
+              arrivalHandledRef.current = true;
+              Speech.stop();
+              Speech.speak("You have arrived at your destination.", {
+                language: "en-US",
+                rate: voiceSpeed,
+              });
+              Alert.alert("Arrived", `You have reached ${destinationName || "your destination"}.`);
+              setNavigationStarted(false);
+              return;
+            }
+
+            // 2) Off-route detection. Require 3 consecutive samples before rerouting
+            // to avoid false positives from GPS jitter.
+            if (routeCoordinates.length > 1 && !reroutingRef.current) {
+              const routeDistance = distanceToRouteMeters(coords, routeCoordinates);
+
+              if (routeDistance > 70) {
+                offRouteCountRef.current += 1;
+              } else {
+                offRouteCountRef.current = 0;
+              }
+
+              if (offRouteCountRef.current >= 3) {
+                offRouteCountRef.current = 0;
+                reroutingRef.current = true;
+                Speech.stop();
+                Speech.speak("You are off route. Recalculating.", {
+                  language: "en-US",
+                  rate: voiceSpeed,
+                });
+
+                void calculateRoute(coords, destination, {
+                  avoidTraffic,
+                }).finally(() => {
+                  reroutingRef.current = false;
+                });
+              }
+            }
+
+            // 3) Turn-by-turn step progression.
+            if (routeStepsRef.current.length > 0) {
+              const step = routeStepsRef.current[currentStepIndexRef.current];
+              if (step?.endLocation) {
+                const remaining = distanceBetween(coords, step.endLocation);
+                if (remaining < 45 && currentStepIndexRef.current < routeStepsRef.current.length - 1) {
+                  currentStepIndexRef.current += 1;
+                  setCurrentStepIndex(currentStepIndexRef.current);
+                  const nextStep = routeStepsRef.current[currentStepIndexRef.current];
+                  if (nextStep?.instruction) {
+                    speakNavigationInstruction(nextStep.instruction);
+                  }
                 }
               }
             }
@@ -822,7 +1653,7 @@ export default function MapScreen() {
     } catch (error) {
       console.warn("[Navigation] Live GPS error:", error);
     }
-  }, [navigationStarted]);
+  }, [navigationStarted, navigationPaused, destination, destinationName, routeCoordinates, avoidTraffic, calculateRoute]);
 
   const stopLiveNavigation = useCallback(() => {
     locationSubscriptionRef.current?.remove();
@@ -1093,6 +1924,7 @@ export default function MapScreen() {
       return;
     }
 
+    setNavigationPaused(false);
     setNavigationStarted(true);
     const currentCenter = origin || destination;
 
@@ -1116,12 +1948,17 @@ export default function MapScreen() {
     setDestinationName("");
     setRouteReady(false);
     setNavigationStarted(false);
+    setNavigationPaused(false);
+    setAvoidTraffic(false);
     setTravelInfo(null);
     setRouteCoordinates([]);
     setRouteSteps([]);
     routeStepsRef.current = [];
     setCurrentStepIndex(0);
     currentStepIndexRef.current = 0;
+    offRouteCountRef.current = 0;
+    reroutingRef.current = false;
+    arrivalHandledRef.current = false;
 
     Speech.stop();
     stopLiveNavigation();
@@ -1281,9 +2118,13 @@ export default function MapScreen() {
             </View>
 
             <View style={styles.turnTextBlock}>
-              <Text style={styles.turnDistance}>{formatMeters(currentStepDistance)}</Text>
+              <Text style={styles.turnDistance}>
+                {navigationPaused ? "PAUSED" : formatMeters(currentStepDistance)}
+              </Text>
               <Text style={styles.turnInstruction} numberOfLines={1}>
-                {currentStep?.instruction || "Continue straight"}
+                {navigationPaused
+                  ? "Navigation paused"
+                  : currentStep?.instruction || "Continue straight"}
               </Text>
               <View style={styles.turnDestinationRow}>
                 <Ionicons name="flag" size={16} color="#E7F5EA" />
@@ -1316,13 +2157,45 @@ export default function MapScreen() {
             <View style={styles.navigationControls}>
               <TouchableOpacity
                 style={styles.navigationControlButton}
-                onPress={() => Speech.speak(currentStep?.instruction || "Continue straight", { language: "en-US", rate: 0.95 })}
+                onPress={() => {
+                  const step = routeStepsRef.current[currentStepIndexRef.current];
+                  if (step?.instruction) {
+                    Speech.stop();
+                    Speech.speak(step.instruction, {
+                      language: "en-US",
+                      rate: voiceSpeed,
+                    });
+                  }
+                }}
               >
                 <Ionicons name="volume-high" size={22} color="#FFFFFF" />
               </TouchableOpacity>
 
-              <TouchableOpacity style={styles.navigationControlButton} onPress={() => Speech.stop()}>
-                <Ionicons name="volume-mute" size={22} color="#FFFFFF" />
+              <TouchableOpacity
+                style={styles.navigationControlButton}
+                onPress={() =>
+                  navigationPaused ? resumeNavigation() : pauseNavigation()
+                }
+              >
+                <Ionicons
+                  name={navigationPaused ? "play" : "pause"}
+                  size={22}
+                  color="#FFFFFF"
+                />
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.navigationControlButton}
+                onPress={() => void recalculateAlternativeRoute()}
+              >
+                <Ionicons name="git-compare" size={22} color="#FFFFFF" />
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.navigationControlButton}
+                onPress={() => void recalculateAvoidTrafficRoute()}
+              >
+                <Ionicons name="car" size={22} color="#FFFFFF" />
               </TouchableOpacity>
 
               <TouchableOpacity
@@ -1335,18 +2208,6 @@ export default function MapScreen() {
                 }
               >
                 <Ionicons name="locate" size={22} color="#FFFFFF" />
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.navigationControlButton}
-                onPress={() =>
-                  mapRef.current?.animateCamera(
-                    { center: origin || destination!, zoom: 17, pitch: 35 },
-                    { duration: 600 }
-                  )
-                }
-              >
-                <Ionicons name="expand" size={22} color="#FFFFFF" />
               </TouchableOpacity>
             </View>
           </View>
@@ -1446,8 +2307,91 @@ export default function MapScreen() {
       )}
 
 
+      <Modal
+        visible={sosPickerVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSosPickerVisible(false)}
+      >
+        <View style={styles.sosModalBackdrop}>
+          <View style={styles.sosModalCard}>
+            <View style={styles.sosModalHeader}>
+              <View>
+                <Text style={styles.sosModalTitle}>Emergency SOS</Text>
+                <Text style={styles.sosModalSubtitle}>Select who should receive the alert</Text>
+              </View>
+              <TouchableOpacity onPress={() => setSosPickerVisible(false)}>
+                <Ionicons name="close" size={25} color="#111827" />
+              </TouchableOpacity>
+            </View>
+
+            {sosContacts.map((contact) => {
+              const selected = selectedSosIds.includes(contact.id);
+              return (
+                <TouchableOpacity
+                  key={contact.id}
+                  style={[styles.sosContactRow, selected && styles.sosContactRowSelected]}
+                  onPress={() => {
+                    setSelectedSosIds((current) =>
+                      current.includes(contact.id)
+                        ? current.filter((id) => id !== contact.id)
+                        : [...current, contact.id]
+                    );
+                  }}
+                >
+                  <View style={styles.sosContactIcon}>
+                    <Ionicons name="person" size={19} color="#EF4444" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.sosContactName}>{contact.name}</Text>
+                    <Text style={styles.sosContactMeta}>{contact.relation} • {contact.phone}</Text>
+                  </View>
+                  <Ionicons
+                    name={selected ? "checkbox" : "square-outline"}
+                    size={25}
+                    color={selected ? "#EF4444" : "#9CA3AF"}
+                  />
+                </TouchableOpacity>
+              );
+            })}
+
+            <Text style={styles.sosLocationHint}>
+              GPS location will be requested before the SMS/call options are shown.
+            </Text>
+
+            <TouchableOpacity
+              style={styles.sosConfirmButton}
+              onPress={() => void confirmSelectedSos()}
+              disabled={sosLoading}
+            >
+              {sosLoading ? (
+                <Text style={styles.sosConfirmText}>Preparing SOS...</Text>
+              ) : (
+                <>
+                  <Ionicons name="warning" size={21} color="#FFFFFF" />
+                  <Text style={styles.sosConfirmText}>Continue with SOS</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {/* FLOATING BUTTONS */}
       <View style={styles.floatingButtons} pointerEvents="box-none">
+        <TouchableOpacity
+          style={styles.sosFloatBtn}
+          onPress={() => void triggerEmergencySOS()}
+          disabled={sosLoading}
+          activeOpacity={0.85}
+          accessibilityLabel="Emergency SOS"
+        >
+          <Ionicons
+            name="warning"
+            size={24}
+            color="#FFFFFF"
+          />
+        </TouchableOpacity>
         <TouchableOpacity style={styles.floatBtn} onPress={getCurrentLocation}>
           <Ionicons name="location" size={24} color="#2563EB" />
         </TouchableOpacity>
@@ -1504,9 +2448,11 @@ export default function MapScreen() {
                 <View style={styles.navigationStatus}>
                   <View style={styles.statusDot} />
                   <View style={styles.statusTextContainer}>
-                    <Text style={styles.navigationStatusText}>Navigation active</Text>
+                    <Text style={styles.navigationStatusText}>
+                      {navigationPaused ? "Navigation paused" : "Navigation active"}
+                    </Text>
                     <Text style={styles.navigationSubText}>
-                      Following route to {destinationName || "destination"}
+                      {avoidTraffic ? "Traffic-aware route" : "Following route"} to {destinationName || "destination"}
                     </Text>
                   </View>
                   <Ionicons name="navigate" size={24} color="#2563EB" />
@@ -1754,6 +2700,63 @@ const styles = StyleSheet.create({
   },
 
   // FLOATING BUTTONS
+  sosFloatBtn: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: "#DC2626",
+    alignItems: "center",
+    justifyContent: "center",
+    elevation: 7,
+    shadowColor: "#000000",
+    shadowOpacity: 0.18,
+    shadowRadius: 7,
+    shadowOffset: { width: 0, height: 3 },
+    marginBottom: 12,
+  },
+
+  sosModalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "flex-end",
+  },
+  sosModalCard: {
+    backgroundColor: "#FFFFFF",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 20,
+    paddingBottom: 28,
+  },
+  sosModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  sosModalTitle: { fontSize: 21, fontWeight: "800", color: "#111827" },
+  sosModalSubtitle: { marginTop: 3, color: "#6B7280", fontSize: 13 },
+  sosContactRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 13,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    marginBottom: 9,
+  },
+  sosContactRowSelected: { borderColor: "#FCA5A5", backgroundColor: "#FFF7F7" },
+  sosContactIcon: {
+    width: 40, height: 40, borderRadius: 20, backgroundColor: "#FEE2E2",
+    alignItems: "center", justifyContent: "center", marginRight: 11,
+  },
+  sosContactName: { fontSize: 15, fontWeight: "700", color: "#111827" },
+  sosContactMeta: { fontSize: 12, color: "#6B7280", marginTop: 3 },
+  sosLocationHint: { fontSize: 12, color: "#6B7280", lineHeight: 18, marginVertical: 12 },
+  sosConfirmButton: {
+    minHeight: 52, borderRadius: 14, backgroundColor: "#DC2626",
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8,
+  },
+  sosConfirmText: { color: "#FFFFFF", fontSize: 16, fontWeight: "800" },
   floatingButtons: {
     position: "absolute",
     right: 20,

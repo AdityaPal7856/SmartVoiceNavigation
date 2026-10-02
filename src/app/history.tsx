@@ -457,13 +457,20 @@ export default function HistoryScreen() {
   }
 
   function openHistoryItem(item: HistoryItem) {
-    if (!item.destination && !item.category) return;
+    const destination =
+      item.destination || item.category || item.title;
 
+    if (!destination) return;
+
+    // Reuse the selected history item directly in navigation.
+    // MapScreen already supports autoStart=true for voice-originated
+    // navigation, so history reuse follows the same route flow.
     router.push({
       pathname: "/(tabs)/map",
       params: {
-        destination:
-          item.destination || item.category || item.title,
+        destination,
+        autoStart: "true",
+        historyReuse: "true",
       },
     });
   }
@@ -589,6 +596,10 @@ export default function HistoryScreen() {
 
                 <Text style={styles.time}>
                   {item.time}
+                </Text>
+
+                <Text style={styles.reuseHint}>
+                  Tap to navigate again
                 </Text>
               </View>
 
@@ -747,6 +758,13 @@ const styles = StyleSheet.create({
     color: "#9CA3AF",
     marginTop: 5,
     fontSize: 12,
+  },
+
+  reuseHint: {
+    color: "#2563EB",
+    marginTop: 6,
+    fontSize: 11,
+    fontWeight: "600",
   },
 
   deleteButton: {

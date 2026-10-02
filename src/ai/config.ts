@@ -4,7 +4,7 @@ import Constants from "expo-constants";
 // Gemini API key yahan MAT rakho.
 export const AI_API_BASE_URL =
   Constants.expoConfig?.extra?.aiApiBaseUrl ??
-  "http://10.0.2.2:3000";
+    "http://192.168.29.87:3000";
 
 // Optional model name.
 // Actual Gemini API key backend/.env mein rahegi.

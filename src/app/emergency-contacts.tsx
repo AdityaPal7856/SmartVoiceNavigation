@@ -12,6 +12,7 @@ import {
   Linking,
 } from "react-native";
 
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
 
@@ -23,6 +24,8 @@ import {
 } from "firebase/firestore";
 
 import { auth, db } from "../firebase";
+
+const EMERGENCY_CONTACTS_CACHE_KEY = "@smart_voice_navigation_emergency_contacts";
 
 type Contact = {
   id: string;
@@ -53,69 +56,88 @@ export default function EmergencyContacts() {
   // ==========================================
 
   useEffect(() => {
-    const unsubscribe =
-      auth.onAuthStateChanged(
-        async (currentUser) => {
-          setUser(currentUser);
+    let mounted = true;
 
-          if (!currentUser) {
+    const loadContacts = async () => {
+      // Cache-first: contacts remain visible even when Firebase is temporarily offline.
+      try {
+        const cached = await AsyncStorage.getItem(
+          EMERGENCY_CONTACTS_CACHE_KEY
+        );
+        if (cached && mounted) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed)) {
+            setContacts(parsed);
+          }
+        }
+      } catch (error) {
+        console.log("[Emergency] Local cache load error:", error);
+      }
+
+      const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
+        if (!mounted) return;
+
+        setUser(currentUser);
+
+        if (!currentUser) {
+          setLoading(false);
+          return;
+        }
+
+        try {
+          const ref = doc(db, "users", currentUser.uid);
+          const snap = await getDoc(ref);
+
+          if (!snap.exists()) {
             setLoading(false);
             return;
           }
 
-          try {
-            const ref = doc(
-              db,
-              "users",
-              currentUser.uid
-            );
+          const data = snap.data();
+          let nextContacts: Contact[] | null = null;
 
-            const snap = await getDoc(ref);
-
-            if (snap.exists()) {
-              const data = snap.data();
-
-              if (
-                Array.isArray(
-                  data.emergencyContacts
-                )
-              ) {
-                setContacts(
-                  data.emergencyContacts
-                );
-              } else if (
-                data.emergencyContact
-              ) {
-                // Old data support
-                setContacts([
-                  {
-                    id: "default",
-                    name:
-                      data.emergencyContact
-                        .name || "",
-                    relation:
-                      data.emergencyContact
-                        .relation ||
-                      "Emergency Contact",
-                    phone:
-                      data.emergencyContact
-                        .phone || "",
-                  },
-                ]);
-              }
-            }
-          } catch (error) {
-            console.log(
-              "[Emergency] Load error:",
-              error
-            );
-          } finally {
-            setLoading(false);
+          if (Array.isArray(data.emergencyContacts)) {
+            nextContacts = data.emergencyContacts as Contact[];
+          } else if (data.emergencyContact) {
+            // Backward compatibility with the old single-contact format.
+            nextContacts = [
+              {
+                id: "default",
+                name: data.emergencyContact.name || "",
+                relation:
+                  data.emergencyContact.relation || "Emergency Contact",
+                phone: data.emergencyContact.phone || "",
+              },
+            ];
           }
-        }
-      );
 
-    return unsubscribe;
+          if (nextContacts && mounted) {
+            setContacts(nextContacts);
+            await AsyncStorage.setItem(
+              EMERGENCY_CONTACTS_CACHE_KEY,
+              JSON.stringify(nextContacts)
+            );
+          }
+        } catch (error) {
+          console.log("[Emergency] Firebase load error:", error);
+        } finally {
+          if (mounted) setLoading(false);
+        }
+      });
+
+      return unsubscribe;
+    };
+
+    let unsubscribe: (() => void) | undefined;
+
+    void loadContacts().then((cleanup) => {
+      unsubscribe = cleanup;
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
   }, []);
 
   // ==========================================
@@ -127,21 +149,48 @@ export default function EmergencyContacts() {
   ) {
     if (!user) return;
 
-    await setDoc(
-      doc(db, "users", user.uid),
-      {
-        emergencyContacts:
-          nextContacts,
-
-        updatedAt:
-          serverTimestamp(),
-      },
-      {
-        merge: true,
-      }
-    );
-
+    // Update UI and local cache immediately.
     setContacts(nextContacts);
+
+    try {
+      await AsyncStorage.setItem(
+        EMERGENCY_CONTACTS_CACHE_KEY,
+        JSON.stringify(nextContacts)
+      );
+    } catch (error) {
+      console.warn("[Emergency] Local cache save failed:", error);
+    }
+
+    try {
+      // Save to Firebase in the background.
+      await setDoc(
+        doc(db, "users", user.uid),
+        {
+          emergencyContacts:
+            nextContacts,
+
+          updatedAt:
+            serverTimestamp(),
+        },
+        {
+          merge: true,
+        }
+      );
+
+      console.log(
+        "[Emergency] Contacts saved successfully"
+      );
+    } catch (error) {
+      console.error(
+        "[Emergency] Firebase save failed:",
+        error
+      );
+
+      Alert.alert(
+        "Save Failed",
+        "Contact could not be saved to Firebase. Please check your internet connection and try again."
+      );
+    }
   }
 
   // ==========================================
@@ -501,6 +550,18 @@ export default function EmergencyContacts() {
                         name="chatbubble-outline"
                         size={20}
                         color="#2874F0"
+                      />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      onPress={() => editContact(contact)}
+                      style={styles.actionButton}
+                      accessibilityLabel={`Edit ${contact.name}`}
+                    >
+                      <Ionicons
+                        name="create-outline"
+                        size={20}
+                        color="#F59E0B"
                       />
                     </TouchableOpacity>
 

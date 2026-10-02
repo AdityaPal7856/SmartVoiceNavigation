@@ -104,29 +104,49 @@ export default function HomeScreen() {
     return null;
   };
   // ==================================================
-  // LOAD USER NAME FROM FIREBASE
+  // LOAD USER NAME - LOCAL FIRST, FIREBASE FALLBACK
   // ==================================================
 
   useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
 
-    const unsubscribe =
-      auth.onAuthStateChanged(
+    const loadUserName = async () => {
+      // 1. Pehle local storage se name immediately load karo
+      //    Isse Firebase response ka wait nahi hoga.
+      try {
+        const localName =
+          await AsyncStorage.getItem("userName");
+
+        if (localName?.trim()) {
+          setUserName(localName.trim());
+
+          console.log(
+            "[HomeScreen] User name loaded locally:",
+            localName.trim()
+          );
+        }
+      } catch (error) {
+        console.log(
+          "[HomeScreen] Local user name load failed:",
+          error
+        );
+      }
+
+      // 2. Firebase ko background mein fallback/update ke liye use karo
+      unsubscribe = auth.onAuthStateChanged(
         async (currentUser) => {
-
-          // No logged-in user
           if (!currentUser) {
-            setUserName("User");
+            // Agar local name already hai to usko replace mat karo
+            const localName =
+              await AsyncStorage.getItem("userName");
+
+            if (!localName?.trim()) {
+              setUserName("User");
+            }
             return;
           }
 
           try {
-
-            console.log(
-              "[HomeScreen] Loading user profile:",
-              currentUser.uid
-            );
-
-            // users/{uid}
             const userRef = doc(
               db,
               "users",
@@ -136,65 +156,56 @@ export default function HomeScreen() {
             const userSnap =
               await getDoc(userRef);
 
+            let firebaseName = "";
+
             if (userSnap.exists()) {
+              const data = userSnap.data();
 
-              const data =
-                userSnap.data();
-
-              const savedName =
+              firebaseName =
                 typeof data.name === "string"
                   ? data.name.trim()
                   : "";
-
-              if (savedName) {
-
-                setUserName(
-                  savedName
-                );
-
-                console.log(
-                  "[HomeScreen] User name:",
-                  savedName
-                );
-
-              } else {
-
-                // Firestore mein name nahi hai
-                setUserName(
-                  currentUser.displayName ||
-                  "User"
-                );
-              }
-
-            } else {
-
-              // User document doesn't exist
-              setUserName(
-                currentUser.displayName ||
-                "User"
-              );
             }
 
+            const finalName =
+              firebaseName ||
+              currentUser.displayName?.trim() ||
+              "";
+
+            if (finalName) {
+              // Firebase se milne wala latest name
+              // local mein bhi save kar do.
+              await AsyncStorage.setItem(
+                "userName",
+                finalName
+              );
+
+              setUserName(finalName);
+
+              console.log(
+                "[HomeScreen] User name synced:",
+                finalName
+              );
+            }
           } catch (error) {
-
-            console.error(
-              "[HomeScreen] Failed to load user name:",
+            // Firebase slow/offline hone par
+            // local name already screen par rahega.
+            console.log(
+              "[HomeScreen] Firebase name sync skipped:",
               error
-            );
-
-            // Firebase fail hone par
-            // Google/Firebase display name use karo
-            setUserName(
-              currentUser.displayName ||
-              "User"
             );
           }
         }
       );
+    };
 
-    // Auth listener cleanup
-    return unsubscribe;
+    loadUserName();
 
+    return () => {
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
   }, []);
 
   // ==================================================

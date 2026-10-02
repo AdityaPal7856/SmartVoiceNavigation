@@ -12,7 +12,7 @@ import {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
-import { useTheme } from "../../context/ThemeContext";
+import { useTheme } from "../context/ThemeContext";
 
 const SETTINGS_KEY = "@smart_voice_navigation_settings";
 
@@ -23,6 +23,10 @@ type Settings = {
   voiceLanguage: "English (India)" | "Hindi (India)" | "Hinglish";
   voiceType: "Male" | "Female";
   distanceUnit: "Kilometers" | "Miles";
+  avoidTolls: boolean;
+  avoidHighways: boolean;
+  avoidFerries: boolean;
+  voiceSpeed: number;
 };
 
 const DEFAULT_SETTINGS: Settings = {
@@ -32,6 +36,10 @@ const DEFAULT_SETTINGS: Settings = {
   voiceLanguage: "English (India)",
   voiceType: "Male",
   distanceUnit: "Kilometers",
+  avoidTolls: false,
+  avoidHighways: false,
+  avoidFerries: false,
+  voiceSpeed: 1.0,
 };
 
 export default function SettingsScreen() {
@@ -151,6 +159,7 @@ export default function SettingsScreen() {
   }
 
 
+  if (loading) {
   return (
       <SafeAreaView
         style={[
@@ -520,6 +529,141 @@ export default function SettingsScreen() {
             }
           />
         </View>
+
+        {/* Advanced Navigation */}
+        <Text
+          style={[
+            styles.section,
+            { color: colors.secondary },
+          ]}
+        >
+          Advanced Navigation
+        </Text>
+
+        {[
+          ["avoidTolls", "cash-outline", "Avoid Toll Roads"],
+          ["avoidHighways", "car-outline", "Avoid Highways"],
+          ["avoidFerries", "boat-outline", "Avoid Ferries"],
+        ].map(([key, icon, label]) => (
+          <View
+            key={key}
+            style={[
+              styles.card,
+              {
+                backgroundColor: colors.card,
+                borderColor: colors.border,
+              },
+            ]}
+          >
+            <View style={styles.left}>
+              <View
+                style={[
+                  styles.iconBox,
+                  {
+                    backgroundColor: isDark
+                      ? "#1F2937"
+                      : "#EEF2FF",
+                  },
+                ]}
+              >
+                <Ionicons
+                  name={icon as any}
+                  size={21}
+                  color={colors.primary}
+                />
+              </View>
+
+              <Text
+                style={[
+                  styles.itemText,
+                  { color: colors.text },
+                ]}
+              >
+                {label}
+              </Text>
+            </View>
+
+            <Switch
+              value={Boolean(settings[key as keyof Settings])}
+              trackColor={{
+                false: "#D1D5DB",
+                true: colors.primary,
+              }}
+              thumbColor="#FFFFFF"
+              onValueChange={(value) =>
+                void updateSettings({
+                  [key]: value,
+                } as Partial<Settings>)
+              }
+            />
+          </View>
+        ))}
+
+        <TouchableOpacity
+          style={[
+            styles.card,
+            {
+              backgroundColor: colors.card,
+              borderColor: colors.border,
+            },
+          ]}
+          onPress={() =>
+            chooseOption(
+              "Voice Speed",
+              `${settings.voiceSpeed.toFixed(1)}x`,
+              ["0.7x", "0.8x", "0.9x", "1.0x", "1.1x", "1.2x"],
+              (value) =>
+                updateSettings({
+                  voiceSpeed: Number(value.replace("x", "")),
+                })
+            )
+          }
+        >
+          <View style={styles.left}>
+            <View
+              style={[
+                styles.iconBox,
+                {
+                  backgroundColor: isDark
+                    ? "#1F2937"
+                    : "#EEF2FF",
+                },
+              ]}
+            >
+              <Ionicons
+                name="volume-high-outline"
+                size={21}
+                color={colors.primary}
+              />
+            </View>
+
+            <Text
+              style={[
+                styles.itemText,
+                { color: colors.text },
+              ]}
+            >
+              Voice Speed
+            </Text>
+          </View>
+
+          <View style={styles.right}>
+            <Text
+              style={[
+                styles.value,
+                { color: colors.secondary },
+              ]}
+            >
+              {settings.voiceSpeed.toFixed(1)}x
+            </Text>
+
+            <Ionicons
+              name="chevron-forward"
+              size={18}
+              color={colors.icon}
+            />
+          </View>
+        </TouchableOpacity>
 
         {/* Notifications */}
         <Text

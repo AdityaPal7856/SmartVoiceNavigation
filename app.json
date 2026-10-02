@@ -58,12 +58,13 @@
           "backgroundColor": "#FFFFFF",
           "imageWidth": 280
         }
-      ]
+      ],
+      "expo-image"
     ],
     "extra": {
       "googleMapsRoutesApiKey": "AIzaSyCt-FxXEPDIEmFpwl5x_EiH0KqXGE-fISo",
       "googlePlacesApiKey": "AIzaSyBhubzjQAfm-oJGmynjlRwYOD5xY99QTH8",
-      "aiApiBaseUrl": "http://10.0.2.2:3000",
+      "aiApiBaseUrl": "http://192.168.29.87:3000",
       "geminiModel": "gemini-2.0-flash",
       "router": {},
       "eas": {

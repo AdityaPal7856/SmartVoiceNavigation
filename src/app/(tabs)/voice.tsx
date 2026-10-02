@@ -7,6 +7,8 @@ import React, {
 import {
   View,
   Text,
+  Alert,
+  Linking,
   StyleSheet,
   TouchableOpacity,
   Animated,
@@ -16,11 +18,13 @@ import {
 } from "react-native";
 
 import { SafeAreaView } from "react-native-safe-area-context";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 
 import * as Speech from "expo-speech";
 import * as Haptics from "expo-haptics";
+import * as Location from "expo-location";
 
 import {
   askAI,
@@ -33,6 +37,8 @@ import {
   collection,
   addDoc,
   serverTimestamp,
+  doc,
+  getDoc,
 } from "firebase/firestore";
 
 import { auth, db } from "../../firebase";
@@ -101,6 +107,12 @@ const COMMAND_CHIPS = [
     label: "🏧 ATM",
     prompt: "Find nearest ATM",
   },
+  { label: "🇮🇳 Hindi Nav", prompt: "Hindi navigation" },
+  { label: "🛣 Avoid Toll", prompt: "Avoid toll roads" },
+  {
+    label: "🚨 SOS",
+    prompt: "Emergency SOS",
+  },
 ];
 
 /* =========================================================
@@ -108,7 +120,7 @@ const COMMAND_CHIPS = [
 ========================================================= */
 
 const STATUS_LABEL: Record<Status, string> = {
-  idle: "Tap Siri Orb to start",
+  idle: "Voice ready — say a command",
   recording: "Listening...",
   uploading: "Processing Audio...",
   transcribing: "Converting to text...",
@@ -168,17 +180,59 @@ export default function VoiceTab() {
   const [waveIndex, setWaveIndex] =
     useState(0);
 
+  const [voiceSpeed, setVoiceSpeed] = useState(1.0);
+  const [voiceLanguage, setVoiceLanguage] = useState<"English (India)" | "Hindi (India)" | "Hinglish">("Hinglish");
+
   const [audioUri, setAudioUri] =
     useState<string | null>(null);
 
+  // Voice-first / no-touch navigation mode.
+  // When enabled, the user can start navigation and control common
+  // navigation actions entirely through voice commands.
+  const [voiceNavigationMode, setVoiceNavigationMode] =
+    useState(true);
+
   const lastRecognizedTextRef =
     useRef("");
+
+  // Hands-free / no-touch recognition lifecycle.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const raw = await AsyncStorage.getItem("@smart_voice_navigation_settings");
+        if (!raw) return;
+        const saved = JSON.parse(raw);
+        if (typeof saved.voiceSpeed === "number") setVoiceSpeed(Math.min(1.2, Math.max(0.7, saved.voiceSpeed)));
+        if (saved.voiceLanguage === "English (India)" || saved.voiceLanguage === "Hindi (India)" || saved.voiceLanguage === "Hinglish") {
+          setVoiceLanguage(saved.voiceLanguage);
+        }
+      } catch (e) {
+        console.warn("[VoiceTab] Settings load failed:", e);
+      }
+    })();
+  }, []);
+
+  const voiceNavigationModeRef = useRef(true);
+  const recognitionRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recognitionStartingRef = useRef(false);
+
+  // Prevent the "end" event from starting a new recognizer while the
+  // recognized command is still being processed / spoken.
+  const processingCommandRef = useRef(false);
+
+  // Android SpeechRecognizer can report transient network/no-speech
+  // errors. Keep network retries bounded so we do not hammer the service.
+  const networkErrorCountRef = useRef(0);
 
   /* -------------------------------------------------------
      AUDIO PLAYER (EXPO-AUDIO)
   ------------------------------------------------------- */
 
   const player = useAudioPlayer(audioUri);
+
+  useEffect(() => {
+    voiceNavigationModeRef.current = voiceNavigationMode;
+  }, [voiceNavigationMode]);
 
   /* -------------------------------------------------------
      DERIVED STATE
@@ -215,11 +269,15 @@ export default function VoiceTab() {
       }
 
       lastRecognizedTextRef.current = text;
+      networkErrorCountRef.current = 0;
+      processingCommandRef.current = true;
+
       console.log("[VoiceTab] Native transcript:", text);
       void processAI(text);
     }
   });
 
+<<<<<<< HEAD
   useSpeechRecognitionEvent("error", (event) => {
     // Android can emit "no-speech" when a recognition session ends
     // normally or when the user stops listening. Do not treat that as
@@ -239,14 +297,109 @@ export default function VoiceTab() {
       event.error === "not-allowed"
         ? "Microphone or speech recognition permission was denied."
         : "Speech recognition failed. Please try again.";
+=======
+useSpeechRecognitionEvent("error", (event) => {
+  const errorCode = String(event.error ?? "").toLowerCase();
+  const errorMessage = String(event.message ?? "");
 
-    setReply(message);
-    Speech.speak(message, { language: "en-US", rate: 0.95 });
-  });
+  console.log(
+    "[VoiceTab] Native speech event:",
+    errorCode,
+    errorMessage
+  );
+
+  setStatus((current) =>
+    current === "recording" ? "idle" : current
+  );
+
+  // Normal Android speech-recognition endings
+  if (
+    errorCode === "no-speech" ||
+    errorCode === "aborted" ||
+    errorCode === "cancelled" ||
+    errorCode === "canceled"
+  ) {
+    console.log(
+      "[VoiceTab] Speech ended normally:",
+      errorCode
+    );
+    return;
+  }
+
+  // Android sometimes returns slightly different error names
+  if (
+    errorCode.includes("no_speech") ||
+    errorCode.includes("aborted") ||
+    errorCode.includes("cancel")
+  ) {
+    console.log(
+      "[VoiceTab] Non-critical speech event:",
+      errorCode
+    );
+    return;
+  }
+
+  // Permission denied
+  if (
+    errorCode === "not-allowed" ||
+    errorCode === "permission-denied" ||
+    errorCode.includes("permission")
+  ) {
+    console.error(
+      "[VoiceTab] Microphone permission denied:",
+      errorCode,
+      errorMessage
+    );
+
+    setStatus("error");
+
+    Speech.stop();
+>>>>>>> 16336d1 (Update SmartVoiceNavigation features)
+
+    const message =
+      "Microphone or speech recognition permission was denied. Please allow microphone permission in settings.";
+
+    Speech.speak(message, {
+      language: getSpeechLanguage(message),
+      rate: voiceSpeed,
+    });
+
+    return;
+  }
+
+  // Other real speech-recognition errors
+  console.error(
+    "[VoiceTab] Native speech error:",
+    errorCode,
+    errorMessage
+  );
+
+  setStatus("error");
+
+  Speech.stop();
+
+  Speech.speak(
+    "Speech recognition failed. Please try again.",
+    {
+      language: getSpeechLanguage(message),
+      rate: voiceSpeed,
+    }
+  );
+});
 
   useSpeechRecognitionEvent("end", () => {
     console.log("[VoiceTab] Native speech recognition ended");
-    setStatus((current) => current === "recording" ? "idle" : current);
+
+    // Do not start another recognizer while processAI is speaking/working.
+    if (processingCommandRef.current) {
+      return;
+    }
+
+    if (voiceNavigationModeRef.current) {
+      scheduleRecognitionRestart(700);
+    } else {
+      setStatus((current) => current === "recording" ? "idle" : current);
+    }
   });
 
   /* =========================================================
@@ -255,6 +408,13 @@ export default function VoiceTab() {
 
   useEffect(() => {
    return () => {
+  voiceNavigationModeRef.current = false;
+
+  if (recognitionRestartTimerRef.current) {
+    clearTimeout(recognitionRestartTimerRef.current);
+    recognitionRestartTimerRef.current = null;
+  }
+
   Speech.stop();
   try {
     ExpoSpeechRecognitionModule.abort();
@@ -451,13 +611,68 @@ export default function VoiceTab() {
   };
 
   const getSpeechLanguage = (text: string): string => {
-    // Hindi Devanagari detected -> Hindi voice
-    if (/[\u0900-\u097F]/.test(text)) {
-      return "hi-IN";
+    if (/ [\u0900-\u097F]/.test(text)) return "hi-IN";
+    if (/[\u0900-\u097F]/.test(text)) return "hi-IN";
+    return voiceLanguage === "Hindi (India)" ? "hi-IN" : "en-IN";
+  };
+
+  /* =========================================================
+     NO-TOUCH RECOGNITION SESSION
+  ========================================================= */
+
+  const startRecognitionSession = async () => {
+    if (recognitionStartingRef.current) return;
+    if (!voiceNavigationModeRef.current) return;
+
+    try {
+      recognitionStartingRef.current = true;
+
+      const available =
+        await ExpoSpeechRecognitionModule.isRecognitionAvailable();
+
+      if (!available) {
+        console.warn("[VoiceTab] Speech recognition is unavailable.");
+        return;
+      }
+
+      setStatus("recording");
+
+      ExpoSpeechRecognitionModule.start({
+        lang: voiceLanguage === "Hindi (India)" ? "hi-IN" : "en-IN",
+        interimResults: false,
+
+        // OPPO test device is Android 12 (API 31).
+        // Continuous recognition is not supported on Android 12,
+        // so run one utterance at a time and restart from the "end" event.
+        continuous: false,
+
+        androidIntentOptions: {
+          EXTRA_LANGUAGE_MODEL: "free_form",
+        },
+      });
+
+      console.log("[VoiceTab] Hands-free recognition session started.");
+    } catch (error) {
+      console.error("[VoiceTab] Recognition session error:", error);
+    } finally {
+      recognitionStartingRef.current = false;
+    }
+  };
+
+  const scheduleRecognitionRestart = (delay = 450) => {
+    if (!voiceNavigationModeRef.current) return;
+
+    if (recognitionRestartTimerRef.current) {
+      clearTimeout(recognitionRestartTimerRef.current);
     }
 
-    // English / Hinglish -> Indian English voice
-    return "en-IN";
+    recognitionRestartTimerRef.current = setTimeout(() => {
+      recognitionRestartTimerRef.current = null;
+
+      if (voiceNavigationModeRef.current && !recognitionStartingRef.current) {
+        void startRecognitionSession();
+      }
+    }, delay);
   };
 
   /* =========================================================
@@ -501,13 +716,10 @@ export default function VoiceTab() {
       setDisplayedReply("");
       setIntent(null);
       lastRecognizedTextRef.current = "";
+      voiceNavigationModeRef.current = voiceNavigationMode;
       setStatus("recording");
 
-      ExpoSpeechRecognitionModule.start({
-        lang: "hi-IN",
-        interimResults: false,
-        continuous: false,
-      });
+      await startRecognitionSession();
 
       console.log("[VoiceTab] Native speech recognition requested.");
     } catch (error) {
@@ -523,8 +735,17 @@ export default function VoiceTab() {
 
   const stopVoice = async () => {
     try {
+      voiceNavigationModeRef.current = false;
+      processingCommandRef.current = false;
+
+      if (recognitionRestartTimerRef.current) {
+        clearTimeout(recognitionRestartTimerRef.current);
+        recognitionRestartTimerRef.current = null;
+      }
+
       console.log("[VoiceTab] Stopping native speech recognition...");
       ExpoSpeechRecognitionModule.stop();
+      setVoiceNavigationMode(false);
     } catch (error) {
       console.error("[VoiceTab] Stop voice error:", error);
       setStatus("error");
@@ -644,6 +865,101 @@ export default function VoiceTab() {
       /^(home|work|office|nearby|near me|nearest|घर|काम|ऑफिस|पास|पास में|नज़दीक|नजदीक|नजदीकी)$/i.test(
         value.trim()
       );
+
+    // =========================================================
+    // NO-TOUCH NAVIGATION CONTROLS
+    // =========================================================
+
+    const resumeNavigationPatterns = [
+      /\\b(resume|continue|start again)\\b.*\\b(navigation|route)\\b/i,
+      /\\b(navigation|route)\\b.*\\b(resume|continue|start again)\\b/i,
+      /resume navigation/i,
+      /resume route/i,
+      /नेविगेशन फिर से शुरू करो/i,
+      /रूट फिर से शुरू करो/i,
+      /फिर से चलो/i,
+    ];
+
+    if (resumeNavigationPatterns.some((pattern) => pattern.test(original))) {
+      return {
+        ...general,
+        reply: "Resuming navigation.",
+        intent: "resume_navigation",
+      };
+    }
+
+    const pauseNavigationPatterns = [
+      /\\b(pause|hold|wait)\\b.*\\b(navigation|route)\\b/i,
+      /\\b(navigation|route)\\b.*\\b(pause|hold|wait)\\b/i,
+      /navigation pause/i,
+      /pause route/i,
+      /नेविगेशन रोक कर रखो/i,
+      /नेविगेशन पॉज़ करो/i,
+      /रूट पॉज़ करो/i,
+    ];
+
+    if (pauseNavigationPatterns.some((pattern) => pattern.test(original))) {
+      return {
+        ...general,
+        reply: "Pausing navigation.",
+        intent: "pause_navigation",
+      };
+    }
+
+    const alternativeRoutePatterns = [
+      /alternative route/i,
+      /another route/i,
+      /different route/i,
+      /other route/i,
+      /alternate route/i,
+      /दूसरा रास्ता/i,
+      /दूसरी route/i,
+      /दूसरा रूट/i,
+      /दूसरे रास्ते से/i,
+    ];
+
+    if (alternativeRoutePatterns.some((pattern) => pattern.test(original))) {
+      return {
+        ...general,
+        reply: "Looking for an alternative route.",
+        intent: "alternative_route",
+      };
+    }
+
+    const avoidTrafficPatterns = [
+      /avoid traffic/i,
+      /traffic avoid/i,
+      /कम traffic/i,
+      /traffic कम/i,
+      /ट्रैफिक से बचो/i,
+      /ट्रैफिक कम वाला रास्ता/i,
+      /ट्रैफिक avoid करो/i,
+    ];
+
+    if (avoidTrafficPatterns.some((pattern) => pattern.test(original))) {
+      return {
+        ...general,
+        reply: "Looking for a lower-traffic route.",
+        intent: "avoid_traffic",
+      };
+    }
+
+    const reroutePatterns = [
+      /reroute/i,
+      /re route/i,
+      /route again/i,
+      /फिर से route/i,
+      /फिर से रास्ता/i,
+      /नया रास्ता/i,
+    ];
+
+    if (reroutePatterns.some((pattern) => pattern.test(original))) {
+      return {
+        ...general,
+        reply: "Recalculating your route.",
+        intent: "reroute",
+      };
+    }
 
     // =========================================================
     // STOP / CANCEL NAVIGATION
@@ -931,6 +1247,25 @@ export default function VoiceTab() {
     }
 
     // =========================================================
+    // NAVIGATION SETTINGS / GUIDANCE LANGUAGE
+    // =========================================================
+    if (/^(hindi|हिंदी)\s+(navigation|guidance|directions|नेविगेशन|दिशा)/i.test(original) || /navigation hindi|hindi me navigation|hindi mein navigation/i.test(text)) {
+      return { ...general, reply: "Hindi navigation enabled.", intent: "set_hindi" };
+    }
+    if (/^(english|अंग्रेज़ी)\s+(navigation|guidance|directions|नेविगेशन|दिशा)/i.test(original) || /navigation english/i.test(text)) {
+      return { ...general, reply: "English navigation enabled.", intent: "set_english" };
+    }
+    if (/avoid\s+(toll|tolls)|toll\s*(road|plaza)?\s*avoid|टोल.*बच/i.test(text)) {
+      return { ...general, reply: "I will avoid toll roads.", intent: "avoid_tolls" };
+    }
+    if (/avoid\s+(highway|highways)|highway\s*avoid|हाईवे.*बच/i.test(text)) {
+      return { ...general, reply: "I will avoid highways.", intent: "avoid_highways" };
+    }
+    if (/avoid\s+(ferry|ferries)|ferry\s*avoid|फेरी.*बच/i.test(text)) {
+      return { ...general, reply: "I will avoid ferries.", intent: "avoid_ferries" };
+    }
+
+    // =========================================================
     // DIRECT NAVIGATION
     // =========================================================
     // Handles:
@@ -1078,6 +1413,115 @@ export default function VoiceTab() {
      FIREBASE VOICE HISTORY
   ========================================================= */
 
+  /* =========================================================
+     EMERGENCY SOS
+  ========================================================= */
+
+  const triggerEmergencySOS = async () => {
+    const user = auth.currentUser;
+
+    if (!user) {
+      Alert.alert("Login Required", "Please sign in before using emergency SOS.");
+      return;
+    }
+
+    try {
+      const snap = await getDoc(doc(db, "users", user.uid));
+      const data = snap.exists() ? snap.data() : {};
+      const rawContacts = Array.isArray(data?.emergencyContacts)
+        ? data.emergencyContacts
+        : data?.emergencyContact
+          ? [data.emergencyContact]
+          : [];
+
+      const contacts = rawContacts.filter((contact: any) => contact?.phone);
+
+      if (contacts.length === 0) {
+        Alert.alert(
+          "No Emergency Contact",
+          "Please add an emergency contact before using SOS."
+        );
+        return;
+      }
+
+      const contact = contacts[0];
+
+      Alert.alert(
+        "Confirm SOS",
+        `Contact ${contact.name || "Emergency Contact"} in an emergency?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Confirm SOS",
+            style: "destructive",
+            onPress: async () => {
+              let locationText = "GPS location is currently unavailable.";
+
+              try {
+                const { status } = await Location.requestForegroundPermissionsAsync();
+                if (status === "granted") {
+                  const location = await Location.getCurrentPositionAsync({
+                    accuracy: Location.Accuracy.High,
+                  });
+                  locationText =
+                    `https://www.google.com/maps/search/?api=1&query=${location.coords.latitude},${location.coords.longitude}`;
+                }
+              } catch (error) {
+                console.warn("[VoiceTab][SOS] Location error:", error);
+              }
+
+              const body = [
+                "🚨 EMERGENCY ALERT",
+                "I may need help. Please contact me as soon as possible.",
+                "",
+                "My current location:",
+                locationText,
+              ].join("\n");
+
+              const smsUrl = `sms:${contact.phone}?body=${encodeURIComponent(body)}`;
+
+              try {
+                if (await Linking.canOpenURL(smsUrl)) {
+                  await Linking.openURL(smsUrl);
+                } else {
+                  Alert.alert("SMS Unavailable", "Unable to open the SMS application.");
+                }
+              } catch (error) {
+                console.error("[VoiceTab][SOS] SMS error:", error);
+                Alert.alert("SMS Error", "Unable to open the SMS application.");
+              }
+
+              Alert.alert(
+                "Emergency Call",
+                `Do you want to call ${contact.name || "your emergency contact"}?`,
+                [
+                  { text: "Not Now", style: "cancel" },
+                  {
+                    text: "Call",
+                    onPress: async () => {
+                      const telUrl = `tel:${contact.phone}`;
+                      try {
+                        if (await Linking.canOpenURL(telUrl)) {
+                          await Linking.openURL(telUrl);
+                        }
+                      } catch (error) {
+                        console.error("[VoiceTab][SOS] Call error:", error);
+                        Alert.alert("Call Error", "Unable to open the phone dialer.");
+                      }
+                    },
+                  },
+                ]
+              );
+            },
+          },
+        ]
+      );
+    } catch (error) {
+      console.error("[VoiceTab][SOS] Error:", error);
+      Alert.alert("SOS Error", "Unable to start emergency mode.");
+    }
+  };
+
   const saveVoiceHistory = async (
     question: string,
     answer: string,
@@ -1137,6 +1581,125 @@ export default function VoiceTab() {
     }
   };
 
+
+  const speakServiceReply = (message: string) => {
+    setReply(message);
+    setStatus("speaking");
+    Speech.speak(cleanTextForSpeech(message), {
+      language: getSpeechLanguage(message),
+      rate: voiceSpeed,
+      onDone: () => {
+        setStatus("idle");
+        scheduleRecognitionRestart(350);
+      },
+      onStopped: () => {
+        setStatus("idle");
+        scheduleRecognitionRestart(350);
+      },
+    });
+  };
+
+  const handleWeatherIntent = async () => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        speakServiceReply("Location permission is required to check your local weather.");
+        return;
+      }
+
+      const position = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      const { latitude, longitude } = position.coords;
+
+      const response = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto`
+      );
+      if (!response.ok) throw new Error(`Weather HTTP ${response.status}`);
+
+      const data = await response.json();
+      const current = data?.current;
+      if (!current) throw new Error("Weather data missing");
+
+      const code = Number(current.weather_code);
+      const condition =
+        code === 0 ? "clear sky" :
+        code <= 3 ? "partly cloudy" :
+        code <= 48 ? "foggy" :
+        code <= 67 ? "rainy" :
+        code <= 77 ? "snowy" :
+        code <= 82 ? "showery" :
+        code <= 99 ? "thundery" : "mixed conditions";
+
+      const message =
+        `Current weather: ${Math.round(current.temperature_2m)} degrees Celsius, ` +
+        `${condition}. Feels like ${Math.round(current.apparent_temperature)} degrees, ` +
+        `with wind around ${Math.round(current.wind_speed_10m)} kilometers per hour.`;
+
+      speakServiceReply(message);
+    } catch (error) {
+      console.error("[VoiceTab] Weather error:", error);
+      speakServiceReply("I could not get the current weather right now. Please try again.");
+    }
+  };
+
+  const handleCallIntent = async (nameQuery: string) => {
+    try {
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        speakServiceReply("Please sign in before using voice calling.");
+        return;
+      }
+
+      const snapshot = await getDoc(doc(db, "users", currentUser.uid));
+      const data = snapshot.exists() ? snapshot.data() : {};
+      const contacts = Array.isArray(data?.emergencyContacts)
+        ? data.emergencyContacts
+        : data?.emergencyContact?.phone
+          ? [data.emergencyContact]
+          : [];
+
+      const query = nameQuery.trim().toLowerCase();
+      const contact = contacts.find((item: any) =>
+        String(item?.name || "").toLowerCase().includes(query) ||
+        String(item?.relation || "").toLowerCase().includes(query) ||
+        String(item?.phone || "").replace(/\\D/g, "").includes(query.replace(/\\D/g, ""))
+      );
+
+      if (!contact?.phone) {
+        speakServiceReply(`I could not find a contact named ${nameQuery}.`);
+        return;
+      }
+
+      Alert.alert(
+        "Voice Call",
+        `Call ${contact.name || nameQuery}?`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Call",
+            onPress: async () => {
+              const telUrl = `tel:${contact.phone}`;
+              try {
+                if (await Linking.canOpenURL(telUrl)) {
+                  await Linking.openURL(telUrl);
+                } else {
+                  Alert.alert("Call Unavailable", "Unable to open the phone dialer.");
+                }
+              } catch (error) {
+                console.error("[VoiceTab] Call error:", error);
+                Alert.alert("Call Error", "Unable to open the phone dialer.");
+              }
+            },
+          },
+        ]
+      );
+    } catch (error) {
+      console.error("[VoiceTab] Contact lookup error:", error);
+      speakServiceReply("I could not access your contacts right now.");
+    }
+  };
+
   const processAI = async (
     text: string
   ) => {
@@ -1173,9 +1736,15 @@ export default function VoiceTab() {
 
         Speech.speak(cleanTextForSpeech(localResult.reply), {
           language: getSpeechLanguage(localResult.reply),
-          rate: 0.95,
-          onDone: () => setStatus("idle"),
-          onStopped: () => setStatus("idle"),
+          rate: voiceSpeed,
+          onDone: () => {
+            setStatus("idle");
+            scheduleRecognitionRestart(350);
+          },
+          onStopped: () => {
+            setStatus("idle");
+            scheduleRecognitionRestart(350);
+          },
         });
 
         switch (localResult.intent) {
@@ -1195,13 +1764,54 @@ export default function VoiceTab() {
             await stopNavigation();
             break;
 
+          case "pause_navigation":
+            // The map screen can consume this intent through the same
+            // navigation service/state used by active-route.
+            router.push({
+              pathname: "/(tabs)/map",
+              params: { navigationAction: "pause" },
+            });
+            break;
+
+          case "resume_navigation":
+            router.push({
+              pathname: "/(tabs)/map",
+              params: { navigationAction: "resume" },
+            });
+            break;
+
+          case "alternative_route":
+          case "avoid_traffic":
+          case "reroute":
+          case "set_hindi":
+          case "set_english":
+          case "avoid_tolls":
+          case "avoid_highways":
+          case "avoid_ferries":
+            router.push({
+              pathname: "/(tabs)/map",
+              params: { navigationAction: localResult.intent },
+            });
+            break;
+
           case "traffic":
+            router.push({ pathname: "/(tabs)/map", params: { navigationAction: "traffic" } });
+            break;
           case "weather":
+            await handleWeatherIntent();
+            break;
           case "music":
+            try {
+              await Linking.openURL("https://music.youtube.com/");
+            } catch {
+              Alert.alert("Music", "Unable to open music controls.");
+            }
+            break;
           case "call":
+            if (localResult.destination) await handleCallIntent(localResult.destination);
+            break;
           case "emergency":
-            // These intents are intentionally surfaced to the user.
-            // Connect the corresponding service/action here.
+            await triggerEmergencySOS();
             break;
         }
 
@@ -1256,6 +1866,8 @@ export default function VoiceTab() {
         setReply(result.reply);
         setStatus("error");
 
+        processingCommandRef.current = false;
+
         try {
           await Speech.speak(
             cleanTextForSpeech(
@@ -1263,6 +1875,11 @@ export default function VoiceTab() {
             )
           );
         } catch (_) {}
+
+        if (voiceNavigationModeRef.current) {
+          setStatus("idle");
+          scheduleRecognitionRestart(700);
+        }
 
         return;
       }
@@ -1292,6 +1909,11 @@ export default function VoiceTab() {
         setAudioUri(audioUrl);
         player.replace({ uri: audioUrl });
         player.play();
+
+        // expo-audio does not expose a completion callback in this path here,
+        // so allow the recognizer to resume after playback has started.
+        processingCommandRef.current = false;
+        scheduleRecognitionRestart(700);
       } else {
         const cleanedReply =
           cleanTextForSpeech(
@@ -1317,14 +1939,16 @@ export default function VoiceTab() {
           {
             language: getSpeechLanguage(spokenText),
             pitch: 1,
-            rate: 0.95,
+            rate: voiceSpeed,
 
             onDone: () => {
               console.log(
                 "[VoiceTab] Speech completed"
               );
 
+              processingCommandRef.current = false;
               setStatus("idle");
+              scheduleRecognitionRestart(350);
             },
 
             onStopped: () => {
@@ -1332,7 +1956,9 @@ export default function VoiceTab() {
                 "[VoiceTab] Speech stopped"
               );
 
+              processingCommandRef.current = false;
               setStatus("idle");
+              scheduleRecognitionRestart(350);
             },
 
             onError: (error) => {
@@ -1341,7 +1967,9 @@ export default function VoiceTab() {
                 error
               );
 
+              processingCommandRef.current = false;
               setStatus("idle");
+              scheduleRecognitionRestart(700);
             },
           }
         );
@@ -1379,11 +2007,23 @@ export default function VoiceTab() {
           break;
 
         case "traffic":
+          router.push({ pathname: "/(tabs)/map", params: { navigationAction: "traffic" } });
+          break;
         case "weather":
+          await handleWeatherIntent();
+          break;
         case "music":
+          try {
+            await Linking.openURL("https://music.youtube.com/");
+          } catch {
+            Alert.alert("Music", "Unable to open music controls.");
+          }
+          break;
         case "call":
+          if (result.destination) await handleCallIntent(result.destination);
+          break;
         case "emergency":
-          // Service/action integration can be attached here.
+          await triggerEmergencySOS();
           break;
 
         default:
@@ -1434,6 +2074,7 @@ export default function VoiceTab() {
         errorMessage
       );
 
+      processingCommandRef.current = false;
       setStatus("error");
 
       Speech.speak(
@@ -1781,6 +2422,60 @@ export default function VoiceTab() {
               ) : null}
             </View>
           ) : null}
+
+          {/* =================================================
+              NO-TOUCH NAVIGATION MODE
+          ================================================= */}
+
+          <View style={styles.voiceModeCard}>
+            <View style={styles.voiceModeTextWrap}>
+              <Text style={styles.voiceModeTitle}>
+                No-Touch Navigation
+              </Text>
+              <Text style={styles.voiceModeSubtitle}>
+                {voiceNavigationMode
+                  ? "Hands-free listening is enabled"
+                  : "Turn on for hands-free route control"}
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => {
+                setVoiceNavigationMode((current) => {
+                  const next = !current;
+                  voiceNavigationModeRef.current = next;
+
+                  if (next) {
+                    void startRecognitionSession();
+                  } else {
+                    if (recognitionRestartTimerRef.current) {
+                      clearTimeout(recognitionRestartTimerRef.current);
+                      recognitionRestartTimerRef.current = null;
+                    }
+
+                    try {
+                      ExpoSpeechRecognitionModule.stop();
+                    } catch (_) {}
+
+                    setStatus("idle");
+                  }
+
+                  return next;
+                });
+              }}
+              style={[
+                styles.voiceModeToggle,
+                voiceNavigationMode && styles.voiceModeToggleActive,
+              ]}
+            >
+              <Ionicons
+                name={voiceNavigationMode ? "mic" : "mic-off"}
+                size={20}
+                color="#FFFFFF"
+              />
+            </TouchableOpacity>
+          </View>
 
           {/* =================================================
               QUICK COMMANDS
@@ -2173,6 +2868,50 @@ const styles = StyleSheet.create({
     color: "#A1A1AA",
     fontSize: 13,
     lineHeight: 20,
+  },
+
+  /* NO-TOUCH MODE */
+
+  voiceModeCard: {
+    marginTop: 20,
+    padding: 16,
+    borderRadius: 20,
+    backgroundColor: "rgba(139,92,246,0.10)",
+    borderWidth: 1,
+    borderColor: "rgba(139,92,246,0.25)",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+
+  voiceModeTextWrap: {
+    flex: 1,
+    paddingRight: 12,
+  },
+
+  voiceModeTitle: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "800",
+  },
+
+  voiceModeSubtitle: {
+    color: "#A1A1AA",
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  voiceModeToggle: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.10)",
+  },
+
+  voiceModeToggleActive: {
+    backgroundColor: "#8B5CF6",
   },
 
   /* FOOTER */
